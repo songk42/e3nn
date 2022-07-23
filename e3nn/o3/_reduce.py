@@ -69,45 +69,57 @@ def _wigner_nj(*irrepss, normalization="component", filter_ir_mid=None, dtype=No
     return sorted(ret, key=lambda x: x[0])
 
 
-def find_R(irreps1, irreps2, Q1, Q2, filter_ir_out=None):
-    Rs = {} # dictionary of irreps -> matrix
+def find_R(irreps1, irreps2, Q1, Q2, paths_left, filter_ir_out=None, normalization='component'):
+    Rs = {}  # dictionary of irreps -> matrix
     irreps_out = []
     k1 = 0
     for mul1, ir1 in irreps1:
-        # selectdim(Q1, 1, range(k1,k1 + mul1*ir1.dim))
-        sub_Q1 = Q1[k1:k1+mul1*ir1.dim].reshape(mul1, ir1.dim, -1)
-        k1 += mul1 * ir1.dim
+        sub_Q1 = Q1[k1:k1 + mul1 * ir1.dim].reshape(mul1, ir1.dim, -1)
         k2 = 0
         for mul2, ir2 in irreps2:
-            sub_Q2 = Q2[k2:k2+mul2*ir2.dim].reshape(mul2, ir2.dim, -1)
-            k2 += mul2 * ir2.dim
+            sub_Q2 = Q2[k2:k2 + mul2 * ir2.dim].reshape(mul2, ir2.dim, -1)
             for ir_out in ir1 * ir2:
-                cg = wigner_3j(ir1.l, ir2.l, ir_out.l)
-                ### einsums
-                C = torch.einsum("mia,njb,ijk->mnkab", sub_Q1, sub_Q2, cg)
-                # C.shape essentially becomes (m*n)kab
-                C = C.reshape(C.shape[0] * C.shape[1], C.shape[2], *(Q1.shape[1:]), *(Q2.shape[1:]))
+                C = wigner_3j(ir1.l, ir2.l, ir_out.l)
+                if normalization == 'component':
+                    C *= ir_out.dim**0.5
+                if normalization == 'norm':
+                    C *= ir1.dim**0.5 * ir2.dim**0.5
+                C = torch.einsum("mia,njb,ijk->mnkab", sub_Q1, sub_Q2, C)
+                C = C.reshape(mul1 * mul2, C.shape[2], *(Q1.shape[1:]), *(Q2.shape[1:]))
                 if filter_ir_out is None or ir_out in filter_ir_out:
                     irreps_out.append((mul1 * mul2, ir_out))
+                    # path is something like
+                    # _TP(
+                    #     op=(ir_left, ir, ir_out),
+                    #     args=(path_left, _INPUT(len(irrepss_left), sl.start, sl.stop))
+                    # )
+                    # i + u * ir.dim, i + (u + 1) * ir.dim
                     if ir_out not in Rs.keys():
                         Rs[ir_out] = []
-                    for i in range(C.shape[0]):
-                        Rs[ir_out].append(C[i]) # aliasing?
-                        # so this is where the paths come into play?
+                    for i1, path_left in enumerate(paths_left[ir1]):
+                        for i2 in range(mul2):
+                            path = _TP(
+                                op=(ir1, ir2, ir_out),
+                                args=(path_left, _INPUT(len(irreps1), k2 + i2 * ir2.dim, k2 + (i2 + 1) * ir2.dim))
+                            )
+                            Rs[ir_out].append((path, C[i1 * mul2 + i2]))
+            k2 += mul2 * ir2.dim
+        k1 += mul1 * ir1.dim
     return o3.Irreps(sorted(irreps_out)).simplify(), Rs
 
 
 def find_Q(P, Rs, eps=1e-9):
     Q = []
     outputs = []
+    paths_out = {}
     irreps_out = []
     PP = P @ P.T  # (a,a)
 
     for ir in Rs:
         mul = len(Rs[ir])
-        # paths = [path for path, _ in Rs[ir]]
-        base_o3 = torch.stack([R for R in Rs[ir]])
-        # base_o3 = torch.stack([R for _, R in Rs[ir]])
+        paths = [path for path, _ in Rs[ir]]
+        paths_out[ir] = paths
+        base_o3 = torch.stack([R for _, R in Rs[ir]])
 
         R = base_o3.flatten(2)  # [multiplicity, ir, input basis] (u,j,omega)
 
@@ -118,9 +130,9 @@ def find_Q(P, Rs, eps=1e-9):
             RP = R[:, j] @ P.T  # (u,a)
 
             prob = torch.cat([
-                    torch.cat([RR, -RP], dim=1),
-                    torch.cat([-RP.T, PP], dim=1)
-                ], dim=0)
+                torch.cat([RR, -RP], dim=1),
+                torch.cat([-RP.T, PP], dim=1)
+            ], dim=0)
             eigenvalues, eigenvectors = torch.linalg.eigh(prob)
             X = eigenvectors[:, eigenvalues < eps][:mul].T  # [solutions, multiplicity]
             proj_s.append(X.T @ X)
@@ -138,22 +150,32 @@ def find_Q(P, Rs, eps=1e-9):
             correction = (ir.dim / C.pow(2).sum()) ** 0.5
             C = correction * C
 
-            # outputs.append([((correction * v).item(), p) for v, p in zip(x, paths) if v.abs() > eps])
+            outputs.append([((correction * v).item(), p) for v, p in zip(x, paths) if v.abs() > eps])
             Q.append(C)
-            irreps_out.append((1, ir))
+            irreps_out.append((1, ir)) # not sure if that 1 is right
 
     irreps_out = o3.Irreps(irreps_out).simplify()
-    Q = torch.cat(Q) # this was "originally" vcat
-    return irreps_out, Q#, outputs
+    Q = torch.cat(Q)
+    return irreps_out, Q, outputs, paths_out
 
 
 def _rtp_dq(f0, formulas, irreps, filter_ir_out=None, filter_ir_mid=None, eps=1e-4):
-# def _rtp_dq(f0, formulas, irreps, filter_ir_out=None, filter_ir_mid=None, eps=1e-9):
+    # def _rtp_dq(f0, formulas, irreps, filter_ir_out=None, filter_ir_mid=None, eps=1e-9):
     '''irreps: dict of indices to irreps'''
     # base case
     if len(f0) == 1:
-        ir = irreps[f0[0]]
-        return o3.Irreps(ir), o3.Irreps(ir), torch.eye(ir.dim)#, [] # not sure what "output" is (paths?)
+        irreps_out = o3.Irreps(irreps[f0[0]])
+        output = []
+        paths = {}
+        k = 0
+        for mul, ir in irreps_out:
+            for _ in range(mul):
+                output.append([(1.0, _INPUT(0, k, k + ir.dim))])
+                if ir not in paths:
+                    paths[ir] = []
+                paths[ir].append(_INPUT(0, k, k + ir.dim))
+                k += ir.dim
+        return irreps_out, irreps_out, torch.eye(irreps_out.dim), output, paths
 
     for _sign, p in formulas:
         f = "".join(f0[i] for i in p)
@@ -173,16 +195,16 @@ def _rtp_dq(f0, formulas, irreps, filter_ir_out=None, filter_ir_mid=None, eps=1e
         if i not in f0:
             raise RuntimeError(f"index {i} has an irreps but does not appear in the fomula")
 
-    ### find optimal subformulas
+    # find optimal subformulas
     best_subindices = None
     D_curr = -1
     for subindices in _subsets(len(f0)):
         if len(subindices) > 0 and len(subindices) < len(f0):
             f1 = [f0[i] for i in subindices]
             f2 = [f0[i] for i in range(len(f0)) if i not in subindices]
-            _, formulas1 = _subformulas(f0, formulas, f1)
-            _, formulas2 = _subformulas(f0, formulas, f2)
-            
+            formulas1 = _subformulas(f0, formulas, f1)
+            formulas2 = _subformulas(f0, formulas, f2)
+
             p1 = _find_P_dim(f1, formulas1, **{i: irreps[i].dim for i in f1})
             p2 = _find_P_dim(f2, formulas2, **{i: irreps[i].dim for i in f2})
             if p1 * p2 < D_curr or D_curr == -1:
@@ -191,39 +213,36 @@ def _rtp_dq(f0, formulas, irreps, filter_ir_out=None, filter_ir_mid=None, eps=1e
     assert D_curr != -1
     f1 = [f0[i] for i in best_subindices]
     f2 = [f0[i] for i in range(len(f0)) if i not in best_subindices]
-    formulas1_orig, formulas1 = _subformulas(f0, formulas, f1)
-    formulas2_orig, formulas2 = _subformulas(f0, formulas, f2)
+    formulas1 = _subformulas(f0, formulas, f1)
+    formulas2 = _subformulas(f0, formulas, f2)
 
-    ### bases from the full problem
+    # bases from the full problem
     # permutation basis
-    base_perm, ret = reduce_permutation(f0, formulas, **{i: irs.dim for i, irs in irreps.items()}) # same size as output
-    # is this right??
+    base_perm, _ = reduce_permutation(f0, formulas, **{i: irs.dim for i, irs in irreps.items()})  # same size as output
     P = base_perm.flatten(1)  # [permutation basis, input basis] (a,omega)
 
-    ### Qs from subproblems (irrep outputs)
-    _, out1, Q1 = _rtp_dq(f1, formulas1, {c: irreps[c] for c in f1}, filter_ir_out, filter_ir_mid, eps)
-    _, out2, Q2 = _rtp_dq(f2, formulas2, {c: irreps[c] for c in f2}, filter_ir_out, filter_ir_mid, eps)
-    # _, out1, Q1, _ = _rtp_dq(f1, formulas1, {c: irreps[c] for c in f1}, filter_ir_out, filter_ir_mid, eps)
-    # _, out2, Q2, _ = _rtp_dq(f2, formulas2, {c: irreps[c] for c in f2}, filter_ir_out, filter_ir_mid, eps)
+    # Qs from subproblems (irrep outputs)
+    _, out1, Q1, _, paths1 = _rtp_dq(f1, formulas1, {c: irreps[c] for c in f1}, filter_ir_out, filter_ir_mid, eps)
+    _, out2, Q2, _, _ = _rtp_dq(f2, formulas2, {c: irreps[c] for c in f2}, filter_ir_out, filter_ir_mid, eps)
+    assert len(paths1) == len(out1)
 
-    irreps_out, R = find_R(out1, out2, Q1, Q2, filter_ir_out)
+    irreps_out, R = find_R(out1, out2, Q1, Q2, paths1, filter_ir_out)
 
-    ### if all symmetries are already accounted for, find_Q isn't necessary
+    # if all symmetries are already accounted for, find_Q isn't necessary
     # R needs to be turned into an array
     # if size(P, 1) == sum(map(v -> length(v), values(R))...)
     #     return irreps_in, irreps_out, R
     # end
 
-    ### otherwise, take extra global symmetries into account
-    irreps_out, Q = find_Q(P, R, eps)
-    # irreps_out, Q, outputs = find_Q(P, R, eps)
+    # otherwise, take extra global symmetries into account
+    irreps_out, Q, outputs, paths = find_Q(P, R, eps)
     irreps_in = [irreps[i] for i in f0]
-    return irreps_in, irreps_out, Q#, outputs
+    return irreps_in, irreps_out, Q, outputs, paths  # this "outputs" is _just_ the outputs from the last find_Q
 
 
 def _subsets(n):
     s = list(range(n))
-    return itertools.chain.from_iterable(itertools.combinations(s, r) for r in range(n+1))
+    return itertools.chain.from_iterable(itertools.combinations(s, r) for r in range(n + 1))
 
 
 def _get_ops(path):
@@ -289,7 +308,7 @@ class ReducedTensorProducts(CodeGenMixin, torch.nn.Module):
     # pylint: disable=abstract-method
 
     def __init__(self, formula, filter_ir_out=None, filter_ir_mid=None, eps=1e-4, **irreps):
-    # def __init__(self, formula, filter_ir_out=None, filter_ir_mid=None, eps=1e-9, **irreps):
+        # def __init__(self, formula, filter_ir_out=None, filter_ir_mid=None, eps=1e-9, **irreps):
         super().__init__()
 
         if filter_ir_out is not None:
@@ -312,68 +331,66 @@ class ReducedTensorProducts(CodeGenMixin, torch.nn.Module):
             if len(i) != 1:
                 raise TypeError(f"got an unexpected keyword argument '{i}'")
 
-        irreps_in, irreps_out, change_of_basis = _rtp_dq(f0, formulas, irreps, filter_ir_out, filter_ir_mid, eps)
-        # irreps_in, irreps_out, change_of_basis, outputs = _rtp_dq(f0, formulas, irreps, filter_ir_out, filter_ir_mid, eps)
+        irreps_in, irreps_out, change_of_basis, outputs, _ = _rtp_dq(f0, formulas, irreps, filter_ir_out, filter_ir_mid, eps)
 
-        self.change_of_basis = change_of_basis # this was not in the original code
-        # dtype, _ = explicit_default_types(None, None)
-        # self.register_buffer("change_of_basis", torch.cat(change_of_basis).to(dtype=dtype))
+        dtype, _ = explicit_default_types(None, None)
+        self.register_buffer("change_of_basis", change_of_basis.to(dtype=dtype))
 
-        # tps = set()
-        # for vp_list in outputs:
-        #     for v, p in vp_list:
-        #         for op in _get_ops(p):
-        #             tps.add(op)
+        tps = set()
+        for vp_list in outputs:
+            for v, p in vp_list:
+                for op in _get_ops(p):
+                    tps.add(op)
 
-        # root = torch.nn.Module()
+        root = torch.nn.Module()
 
-        # tps = list(tps)
-        # for i, op in enumerate(tps):
-        #     tp = o3.TensorProduct(op[0], op[1], op[2], [(0, 0, 0, "uuu", False)])
-        #     setattr(root, f"tp{i}", tp)
+        tps = list(tps)
+        for i, op in enumerate(tps):
+            tp = o3.TensorProduct(op[0], op[1], op[2], [(0, 0, 0, "uuu", False)])
+            setattr(root, f"tp{i}", tp)
 
-        # graph = fx.Graph()
-        # tracer = torch.fx.proxy.GraphAppendingTracer(graph)
-        # inputs = [fx.Proxy(graph.placeholder(f"x{i}", torch.Tensor), tracer) for i in f0]
+        graph = fx.Graph()
+        tracer = torch.fx.proxy.GraphAppendingTracer(graph)
+        inputs = [fx.Proxy(graph.placeholder(f"x{i}", torch.Tensor), tracer) for i in f0]
 
         self.irreps_in = irreps_in
         self.irreps_out = o3.Irreps(irreps_out).simplify()
 
-        # values = dict()
+        values = dict()
 
-        # def evaluate(path):
-        #     if path in values:
-        #         return values[path]
+        def evaluate(path):
+            if path in values:
+                return values[path]
 
-        #     if isinstance(path, _INPUT):
-        #         out = inputs[path.tensor]
-        #         if (path.start, path.stop) != (0, self.irreps_in[path.tensor].dim):
-        #             out = out.narrow(-1, path.start, path.stop - path.start)
-        #     if isinstance(path, _TP):
-        #         x1 = evaluate(path.args[0]).node
-        #         x2 = evaluate(path.args[1]).node
-        #         out = fx.Proxy(graph.call_module(f"tp{tps.index(path.op)}", (x1, x2)), tracer)
-        #     values[path] = out
-        #     return out
+            if isinstance(path, _INPUT):
+                out = inputs[path.tensor]
+                if (path.start, path.stop) != (0, self.irreps_in[path.tensor].dim):
+                    out = out.narrow(-1, path.start, path.stop - path.start)
+            if isinstance(path, _TP):
+                x1 = evaluate(path.args[0]).node
+                x2 = evaluate(path.args[1]).node
+                out = fx.Proxy(graph.call_module(f"tp{tps.index(path.op)}", (x1, x2)), tracer)
+            values[path] = out
+            return out
 
-        # outs = []
-        # for vp_list in outputs:
-        #     v, p = vp_list[0]
-        #     out = evaluate(p)
-        #     if abs(v - 1.0) > eps:
-        #         out = v * out
-        #     for v, p in vp_list[1:]:
-        #         t = evaluate(p)
-        #         if abs(v - 1.0) > eps:
-        #             t = v * t
-        #         out = out + t
-        #     outs.append(out)
+        outs = []
+        for vp_list in outputs:
+            v, p = vp_list[0]
+            out = evaluate(p)
+            if abs(v - 1.0) > eps:
+                out = v * out
+            for v, p in vp_list[1:]:
+                t = evaluate(p)
+                if abs(v - 1.0) > eps:
+                    t = v * t
+                out = out + t
+            outs.append(out)
 
-        # out = torch.cat(outs, dim=-1)
-        # graph.output(out.node)
-        # graphmod = fx.GraphModule(root, graph, "main")
+        out = torch.cat(outs, dim=-1)
+        graph.output(out.node)
+        graphmod = fx.GraphModule(root, graph, "main")
 
-        # self._codegen_register({"main": graphmod})
+        self._codegen_register({"main": graphmod})
 
     def __repr__(self):
         return (

@@ -14,16 +14,14 @@ def _subformulas(f0, formulas, subset):
     subset_indices = {i for i in range(len(f0)) if f0[i] in subset}
     standard_indices = {ndx: i for i, ndx in enumerate(subset)}
 
-    subformulas = set()
     subformulas_st = set()
     for s, f in formulas:
         if all([f0[i] in subset or f[i] == i for i in range(len(f0))]):
             f_filtered = tuple(filter(lambda x: x in subset_indices, f))
             f_standard = tuple(map(lambda x: standard_indices[f0[x]], f_filtered))
-            subformulas.add((s, f))
             subformulas_st.add((s, f_standard))
 
-    return subformulas, subformulas_st
+    return subformulas_st
 
 
 def _find_P_dim(f0, formulas, dtype=None, device=None, **dims):
