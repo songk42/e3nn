@@ -69,7 +69,7 @@ def _wigner_nj(*irrepss, normalization="component", filter_ir_mid=None, dtype=No
     return sorted(ret, key=lambda x: x[0])
 
 
-def find_R(irreps1, irreps2, Q1, Q2, paths_left, filter_ir_out=None, normalization='component'):
+def find_R(irreps1, irreps2, Q1, Q2, paths_left, I, filter_ir_out=None, normalization='component', dtype=None):
     Rs = {}  # dictionary of irreps -> matrix
     irreps_out = []
     k1 = 0
@@ -79,7 +79,7 @@ def find_R(irreps1, irreps2, Q1, Q2, paths_left, filter_ir_out=None, normalizati
         for mul2, ir2 in irreps2:
             sub_Q2 = Q2[k2:k2 + mul2 * ir2.dim].reshape(mul2, ir2.dim, -1)
             for ir_out in ir1 * ir2:
-                C = wigner_3j(ir1.l, ir2.l, ir_out.l)
+                C = wigner_3j(ir1.l, ir2.l, ir_out.l, dtype=dtype)
                 if normalization == 'component':
                     C *= ir_out.dim**0.5
                 if normalization == 'norm':
@@ -100,7 +100,7 @@ def find_R(irreps1, irreps2, Q1, Q2, paths_left, filter_ir_out=None, normalizati
                         for i2 in range(mul2):
                             path = _TP(
                                 op=(ir1, ir2, ir_out),
-                                args=(path_left, _INPUT(len(irreps1), k2 + i2 * ir2.dim, k2 + (i2 + 1) * ir2.dim))
+                                args=(path_left, _INPUT(I, k2 + i2 * ir2.dim, k2 + (i2 + 1) * ir2.dim))
                             )
                             Rs[ir_out].append((path, C[i1 * mul2 + i2]))
             k2 += mul2 * ir2.dim
@@ -108,7 +108,7 @@ def find_R(irreps1, irreps2, Q1, Q2, paths_left, filter_ir_out=None, normalizati
     return o3.Irreps(sorted(irreps_out)).simplify(), Rs
 
 
-def find_Q(P, Rs, eps=1e-9):
+def find_Q(P, Rs, eps=1e-9, dtype=None):
     Q = []
     outputs = []
     paths_out = {}
@@ -118,7 +118,6 @@ def find_Q(P, Rs, eps=1e-9):
     for ir in Rs:
         mul = len(Rs[ir])
         paths = [path for path, _ in Rs[ir]]
-        paths_out[ir] = paths
         base_o3 = torch.stack([R for _, R in Rs[ir]])
 
         R = base_o3.flatten(2)  # [multiplicity, ir, input basis] (u,j,omega)
@@ -145,21 +144,29 @@ def find_Q(P, Rs, eps=1e-9):
         # look for an X such that X.T @ X = Projector
         X, _ = orthonormalize(proj_s[0], eps)
 
+        paths_out_tmp = []
         for x in X:
             C = torch.einsum("u,ui...->i...", x, base_o3)
             correction = (ir.dim / C.pow(2).sum()) ** 0.5
             C = correction * C
 
-            outputs.append([((correction * v).item(), p) for v, p in zip(x, paths) if v.abs() > eps])
+            outputs_tmp = []
+            for v, p in zip(x, paths):
+                if v.abs() > eps:
+                    outputs_tmp.append(((correction * v).item(), p))
+                    paths_out_tmp.append(p)
+            outputs.append(outputs_tmp)
             Q.append(C)
             irreps_out.append((1, ir)) # not sure if that 1 is right
+        if len(paths_out_tmp):
+            paths_out[ir] = paths_out_tmp
 
     irreps_out = o3.Irreps(irreps_out).simplify()
-    Q = torch.cat(Q)
+    Q = torch.cat(Q).to(dtype=dtype)
     return irreps_out, Q, outputs, paths_out
 
 
-def _rtp_dq(f0, formulas, irreps, filter_ir_out=None, filter_ir_mid=None, eps=1e-4):
+def _rtp_dq(f0, formulas, irreps, f0_ndx, filter_ir_out=None, filter_ir_mid=None, eps=1e-4, dtype=None):
     # def _rtp_dq(f0, formulas, irreps, filter_ir_out=None, filter_ir_mid=None, eps=1e-9):
     '''irreps: dict of indices to irreps'''
     # base case
@@ -209,7 +216,7 @@ def _rtp_dq(f0, formulas, irreps, filter_ir_out=None, filter_ir_mid=None, eps=1e
             p2 = _find_P_dim(f2, formulas2, **{i: irreps[i].dim for i in f2})
             if p1 * p2 < D_curr or D_curr == -1:
                 D_curr = p1 * p2
-                best_subindices = subindices[:]
+                best_subindices = subindices
     assert D_curr != -1
     f1 = [f0[i] for i in best_subindices]
     f2 = [f0[i] for i in range(len(f0)) if i not in best_subindices]
@@ -218,24 +225,29 @@ def _rtp_dq(f0, formulas, irreps, filter_ir_out=None, filter_ir_mid=None, eps=1e
 
     # bases from the full problem
     # permutation basis
-    base_perm, _ = reduce_permutation(f0, formulas, **{i: irs.dim for i, irs in irreps.items()})  # same size as output
+    base_perm, _ = reduce_permutation(f0, formulas, dtype, **{i: irs.dim for i, irs in irreps.items()})  # same size as output
     P = base_perm.flatten(1)  # [permutation basis, input basis] (a,omega)
 
     # Qs from subproblems (irrep outputs)
-    _, out1, Q1, _, paths1 = _rtp_dq(f1, formulas1, {c: irreps[c] for c in f1}, filter_ir_out, filter_ir_mid, eps)
-    _, out2, Q2, _, _ = _rtp_dq(f2, formulas2, {c: irreps[c] for c in f2}, filter_ir_out, filter_ir_mid, eps)
-    assert len(paths1) == len(out1)
+    _, out1, Q1, _, paths1 = _rtp_dq(f1, formulas1, {c: irreps[c] for c in f1}, f0_ndx, filter_ir_out, filter_ir_mid, eps)
+    _, out2, Q2, _, _ = _rtp_dq(f2, formulas2, {c: irreps[c] for c in f2}, f0_ndx, filter_ir_out, filter_ir_mid, eps)
+    assert len(paths1) == len(out1) # not necessarily the case
 
-    irreps_out, R = find_R(out1, out2, Q1, Q2, paths1, filter_ir_out)
+    # I don't quite trust this f0_ndx[f1[0]] business, what if f1 has more than 1 element
+    # yeah it is incorrect
+    irreps_out, Rs = find_R(out1, out2, Q1, Q2, paths1, len(f1), filter_ir_out, dtype=dtype)
 
     # if all symmetries are already accounted for, find_Q isn't necessary
     # R needs to be turned into an array
-    # if size(P, 1) == sum(map(v -> length(v), values(R))...)
+    # if P.shape[0] == sum(map(lambda v: len(v), Rs.values())):
+    #     paths_out = {}
+    #     for ir in Rs:
+    #         paths_out[ir] = [path for path, _ in Rs[ir]]
+    #         base_o3 = torch.stack([R for _, R in Rs[ir]])
     #     return irreps_in, irreps_out, R
-    # end
 
     # otherwise, take extra global symmetries into account
-    irreps_out, Q, outputs, paths = find_Q(P, R, eps)
+    irreps_out, Q, outputs, paths = find_Q(P, Rs, eps, dtype=dtype)
     irreps_in = [irreps[i] for i in f0]
     return irreps_in, irreps_out, Q, outputs, paths  # this "outputs" is _just_ the outputs from the last find_Q
 
@@ -324,6 +336,7 @@ class ReducedTensorProducts(CodeGenMixin, torch.nn.Module):
                 raise ValueError(f"filter_ir_mid (={filter_ir_mid}) must be an iterable of e3nn.o3.Irrep")
 
         f0, formulas = germinate_formulas(formula)
+        f0_ndx = {f0[i]: i for i in range(len(f0))}
 
         irreps = {i: o3.Irreps(irs) for i, irs in irreps.items()}
 
@@ -331,7 +344,7 @@ class ReducedTensorProducts(CodeGenMixin, torch.nn.Module):
             if len(i) != 1:
                 raise TypeError(f"got an unexpected keyword argument '{i}'")
 
-        irreps_in, irreps_out, change_of_basis, outputs, _ = _rtp_dq(f0, formulas, irreps, filter_ir_out, filter_ir_mid, eps)
+        irreps_in, irreps_out, change_of_basis, outputs, _ = _rtp_dq(f0, formulas, irreps, f0_ndx, filter_ir_out, filter_ir_mid, eps, dtype=torch.float32)
 
         dtype, _ = explicit_default_types(None, None)
         self.register_buffer("change_of_basis", change_of_basis.to(dtype=dtype))
