@@ -166,7 +166,7 @@ def find_Q(P, Rs, eps=1e-9, dtype=None):
     return irreps_out, Q, outputs, paths_out
 
 
-def _rtp_dq(f0, formulas, irreps, f0_ndx, filter_ir_out=None, filter_ir_mid=None, eps=1e-4, dtype=None):
+def _rtp_dq(f0, formulas, irreps, filter_ir_out=None, filter_ir_mid=None, eps=1e-4, dtype=None):
     # def _rtp_dq(f0, formulas, irreps, filter_ir_out=None, filter_ir_mid=None, eps=1e-9):
     '''irreps: dict of indices to irreps'''
     # base case
@@ -218,8 +218,8 @@ def _rtp_dq(f0, formulas, irreps, f0_ndx, filter_ir_out=None, filter_ir_mid=None
                 D_curr = p1 * p2
                 best_subindices = subindices
     assert D_curr != -1
-    f1 = [f0[i] for i in best_subindices]
-    f2 = [f0[i] for i in range(len(f0)) if i not in best_subindices]
+    f2 = [f0[i] for i in best_subindices]
+    f1 = [f0[i] for i in range(len(f0)) if i not in best_subindices]
     formulas1 = _subformulas(f0, formulas, f1)
     formulas2 = _subformulas(f0, formulas, f2)
 
@@ -229,13 +229,11 @@ def _rtp_dq(f0, formulas, irreps, f0_ndx, filter_ir_out=None, filter_ir_mid=None
     P = base_perm.flatten(1)  # [permutation basis, input basis] (a,omega)
 
     # Qs from subproblems (irrep outputs)
-    _, out1, Q1, _, paths1 = _rtp_dq(f1, formulas1, {c: irreps[c] for c in f1}, f0_ndx, filter_ir_out, filter_ir_mid, eps)
-    _, out2, Q2, _, _ = _rtp_dq(f2, formulas2, {c: irreps[c] for c in f2}, f0_ndx, filter_ir_out, filter_ir_mid, eps)
+    _, out1, Q1, outputs1, paths1 = _rtp_dq(f1, formulas1, {c: irreps[c] for c in f1}, filter_ir_out, filter_ir_mid, eps)
+    _, out2, Q2, outputs2, _ = _rtp_dq(f2, formulas2, {c: irreps[c] for c in f2}, filter_ir_out, filter_ir_mid, eps)
     assert len(paths1) == len(out1) # not necessarily the case
 
-    # I don't quite trust this f0_ndx[f1[0]] business, what if f1 has more than 1 element
-    # yeah it is incorrect
-    irreps_out, Rs = find_R(out1, out2, Q1, Q2, paths1, len(f1), filter_ir_out, dtype=dtype)
+    irreps_out_R, Rs = find_R(out1, out2, Q1, Q2, paths1, len(f1), filter_ir_out, dtype=dtype)
 
     # if all symmetries are already accounted for, find_Q isn't necessary
     # R needs to be turned into an array
@@ -320,7 +318,6 @@ class ReducedTensorProducts(CodeGenMixin, torch.nn.Module):
     # pylint: disable=abstract-method
 
     def __init__(self, formula, filter_ir_out=None, filter_ir_mid=None, eps=1e-4, **irreps):
-        # def __init__(self, formula, filter_ir_out=None, filter_ir_mid=None, eps=1e-9, **irreps):
         super().__init__()
 
         if filter_ir_out is not None:
@@ -336,7 +333,6 @@ class ReducedTensorProducts(CodeGenMixin, torch.nn.Module):
                 raise ValueError(f"filter_ir_mid (={filter_ir_mid}) must be an iterable of e3nn.o3.Irrep")
 
         f0, formulas = germinate_formulas(formula)
-        f0_ndx = {f0[i]: i for i in range(len(f0))}
 
         irreps = {i: o3.Irreps(irs) for i, irs in irreps.items()}
 
@@ -344,7 +340,7 @@ class ReducedTensorProducts(CodeGenMixin, torch.nn.Module):
             if len(i) != 1:
                 raise TypeError(f"got an unexpected keyword argument '{i}'")
 
-        irreps_in, irreps_out, change_of_basis, outputs, _ = _rtp_dq(f0, formulas, irreps, f0_ndx, filter_ir_out, filter_ir_mid, eps, dtype=torch.float32)
+        irreps_in, irreps_out, change_of_basis, outputs, _ = _rtp_dq(f0, formulas, irreps, filter_ir_out, filter_ir_mid, eps, dtype=torch.float32)
 
         dtype, _ = explicit_default_types(None, None)
         self.register_buffer("change_of_basis", change_of_basis.to(dtype=dtype))
