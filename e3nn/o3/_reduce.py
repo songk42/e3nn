@@ -219,8 +219,8 @@ def _rtp_dq(f0, formulas, irreps, counter, filter_ir_out=None, filter_ir_mid=Non
                 D_curr = p1 * p2
                 best_subindices = subindices
     assert D_curr != -1
-    f1 = [f0[i] for i in range(len(f0)) if i not in best_subindices]
-    f2 = [f0[i] for i in best_subindices]
+    f1 = [f0[i] for i in best_subindices]
+    f2 = [f0[i] for i in range(len(f0)) if i not in best_subindices]
     formulas1 = _subformulas(f0, formulas, f1)
     formulas2 = _subformulas(f0, formulas, f2)
 
@@ -262,8 +262,9 @@ def _get_ops(path):
         return
     assert isinstance(path, _TP)
     yield path.op
-    for op in _get_ops(path.args[0]):
-        yield op
+    for arg in path.args:
+        for op in _get_ops(arg):
+            yield op
 
 
 @compile_mode("trace")
