@@ -13,8 +13,7 @@ def isapprox(A, B, atol=1e-8, rtol=1e-5):
     return True
 
 
-def test_equivariance():
-    irreps_in = "1o"
+def test_equivariance(irreps_in="1o"):
     tp = ReducedTensorProducts("ijkl=jikl=klij", i = irreps_in)
     Q = tp.change_of_basis
 

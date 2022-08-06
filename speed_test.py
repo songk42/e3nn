@@ -1,5 +1,4 @@
-from e3nn.o3 import ReducedTensorProducts as rtp1
-from e3nn.o3._reduce import ReducedTensorProducts as rtp2
+from e3nn.o3 import ReducedTensorProducts as rtp
 from time import time
 
 
@@ -12,5 +11,4 @@ def timing(func, *args, n=10):
     return tot / n
 
 
-def test_rtp_original():
-    rtp = rtp1("ij=ji", i="1o")
+print(timing(lambda: rtp("ij=ji", i="1o")))
