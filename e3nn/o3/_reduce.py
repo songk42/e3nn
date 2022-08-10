@@ -74,9 +74,11 @@ def find_R(irreps1, irreps2, Q1, Q2, paths_left, paths_right, filter_ir_out=None
     irreps_out = []
     k1 = 0
     for mul1, ir1 in irreps1:
+        assert len(paths_left[ir1]) == mul1
         sub_Q1 = Q1[k1:k1 + mul1 * ir1.dim].reshape(mul1, ir1.dim, -1)
         k2 = 0
         for mul2, ir2 in irreps2:
+            assert len(paths_right[ir2]) == mul2
             sub_Q2 = Q2[k2:k2 + mul2 * ir2.dim].reshape(mul2, ir2.dim, -1)
             for ir_out in ir1 * ir2:
                 C = wigner_3j(ir1.l, ir2.l, ir_out.l, dtype=dtype)
@@ -88,21 +90,19 @@ def find_R(irreps1, irreps2, Q1, Q2, paths_left, paths_right, filter_ir_out=None
                 C = C.reshape(mul1 * mul2, C.shape[2], *(Q1.shape[1:]), *(Q2.shape[1:]))
                 if filter_ir_out is None or ir_out in filter_ir_out:
                     irreps_out.append((mul1 * mul2, ir_out))
-                    # path is something like
-                    # _TP(
-                    #     op=(ir_left, ir, ir_out),
-                    #     args=(path_left, _INPUT(len(irrepss_left), sl.start, sl.stop))
-                    # )
-                    # i + u * ir.dim, i + (u + 1) * ir.dim
                     if ir_out not in Rs.keys():
                         Rs[ir_out] = []
-                    for i1, path_left in enumerate(paths_left[ir1]):
-                        for i2, path_right in enumerate(paths_right[ir2]):
-                            path = _TP(
-                                op=(ir1, ir2, ir_out),
-                                args=(path_left, path_right)
-                            )
-                            Rs[ir_out].append((path, C[i1 * mul2 + i2]))
+                    for i1, set_left in enumerate(paths_left[ir1]):
+                        for i2, set_right in enumerate(paths_right[ir2]):
+                            for path_left in set_left:
+                                for path_right in set_right:
+                                    path = _TP(
+                                        op=(ir1, ir2, ir_out),
+                                        args=(path_left, path_right)
+                                    )
+                                    Rs[ir_out].append((path, C[i1 * mul2 + i2]))
+                                    # am I supposed to be compartmentalizing here too?
+                                    # (i.e. make different lists for each multiplicity)
             k2 += mul2 * ir2.dim
         k1 += mul1 * ir1.dim
     return Rs
@@ -144,9 +144,11 @@ def find_Q(P, Rs, eps=1e-9, dtype=None):
         # look for an X such that X.T @ X = Projector
         X, _ = orthonormalize(proj_s[0], eps)
 
-        paths_out_tmp = []
         for x in X:
+            paths_out_tmp = []
             C = torch.einsum("u,ui...->i...", x, base_o3)
+            if C.pow(2).sum() < eps:
+                continue
             correction = (ir.dim / C.pow(2).sum()) ** 0.5
             C = correction * C
 
@@ -157,9 +159,12 @@ def find_Q(P, Rs, eps=1e-9, dtype=None):
                     paths_out_tmp.append(p)
             outputs.append(outputs_tmp)
             Q.append(C)
-            irreps_out.append((1, ir)) # not sure if that 1 is right
-        if len(paths_out_tmp):
-            paths_out[ir] = paths_out_tmp
+            irreps_out.append((1, ir))
+
+            if len(paths_out_tmp):
+                if ir not in paths_out:
+                    paths_out[ir] = []
+                paths_out[ir].append(paths_out_tmp)
 
     irreps_out = o3.Irreps(irreps_out).simplify()
     Q = torch.cat(Q).to(dtype=dtype)
@@ -179,7 +184,7 @@ def _rtp_dq(f0, formulas, irreps, counter, filter_ir_out=None, filter_ir_mid=Non
                 output.append([(1.0, _INPUT(counter, k, k + ir.dim))])
                 if ir not in paths:
                     paths[ir] = []
-                paths[ir].append(_INPUT(counter, k, k + ir.dim))
+                paths[ir].append([_INPUT(counter, k, k + ir.dim)])
                 k += ir.dim
         if final:
             return irreps_out, irreps_out, torch.eye(irreps_out.dim), output
